@@ -1,0 +1,41 @@
+#!/usr/bin/env -S python3 -I
+"""claude-relaunch [session-id] — second half of claude-reload.
+
+Reads ~/.claude/reload/<session-id>.json (written by claude-reload), deletes it, and execs
+claude with the original flags + environment plus `--resume <session-id>`, in the original
+working directory. Without an argument it picks the newest state file from the last 30 min.
+"""
+import glob
+import json
+import os
+import sys
+import time
+
+STATE_DIR = os.path.join(os.path.expanduser('~'), '.claude', 'reload')
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ('-h', '--help'):
+        print(__doc__.strip())
+        return
+    if len(sys.argv) > 1:
+        path = os.path.join(STATE_DIR, os.path.basename(sys.argv[1]) + '.json')
+    else:
+        files = sorted(glob.glob(os.path.join(STATE_DIR, '*.json')), key=os.path.getmtime)
+        files = [f for f in files if time.time() - os.path.getmtime(f) < 1800]
+        if not files:
+            sys.exit('claude-relaunch: nothing pending (no state from claude-reload in the last 30 min)')
+        path = files[-1]
+    try:
+        with open(path, encoding='utf-8') as fh:
+            st = json.load(fh)
+    except OSError:
+        sys.exit(f'claude-relaunch: no pending relaunch at {path}')
+    os.unlink(path)                                  # holds launch env (tokens) — single use
+    os.chdir(st['cwd'])
+    argv = [st['argv0']] + st['args'] + ['--resume', st['session_id']]
+    os.execve(st['exe'], argv, st['env'])
+
+
+if __name__ == '__main__':
+    main()

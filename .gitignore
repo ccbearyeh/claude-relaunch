@@ -1,0 +1,15 @@
+# Python leftovers.
+__pycache__/
+*.pyc
+
+# Personal agent memory created by local session hooks — not part of the project.
+CLAUDE.md
+FACTS.md
+JOURNAL.md
+docs/facts/
+.claude/
+
+# Backups and editor/OS leftovers.
+*.bak
+*.bak-*
+.DS_Store

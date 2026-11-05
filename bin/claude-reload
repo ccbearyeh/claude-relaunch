@@ -1,0 +1,293 @@
+#!/usr/bin/env -S python3 -I
+"""claude-reload — exit this Claude Code session, relaunch it on the newest installed
+version, and resume the same conversation, in the same pane.
+
+Use it from inside Claude Code:
+    /relaunch            (slash command, ~/.claude/commands/relaunch.md)
+    ! claude-reload      (bash mode — no model turn at all)
+
+How it works
+  1. Finds the claude process that owns this shell (ancestor walk), its exact launch
+     argv + environment (macOS KERN_PROCARGS2), its cwd, and the current session id
+     (~/.claude/sessions/<pid>.json, falling back to $CLAUDE_CODE_SESSION_ID).
+  2. Writes that to ~/.claude/reload/<session-id>.json (mode 600 — the launch env can
+     hold Orca hook tokens; claude-relaunch deletes the file as soon as it reads it).
+  3. Detaches a helper, which sends claude SIGTERM (graceful shutdown), waits for the
+     pane's shell to get the terminal back, then types `claude-relaunch <id>` into the
+     pane — via `herdr pane run` in herdr, `orca terminal send` in Orca.
+  4. claude-relaunch execs `~/.local/bin/claude <original flags> --resume <id>` with the
+     original environment, so Orca/herdr integrations and Remote Control come back.
+
+Outside herdr/Orca it still exits claude; type `claude-relaunch` yourself afterwards.
+Flags: --dry-run  show what would happen, change nothing.   -h, --help  this text.
+Log: ~/.claude/reload/reload.log
+"""
+import ctypes
+import json
+import os
+import re
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser('~')
+STATE_DIR = os.path.join(HOME, '.claude', 'reload')
+LOG = os.path.join(STATE_DIR, 'reload.log')
+NATIVE = os.path.join(HOME, '.local', 'bin', 'claude')
+SHELLS = {'zsh', 'bash', 'sh', 'fish', 'dash', 'ksh', 'tcsh', 'csh', 'nu'}
+
+# Flags that pick or create a session — the relaunch supplies its own --resume.
+DROP_FLAGS = {'-c', '--continue', '-r', '--resume', '--session-id', '--fork-session',
+              '--from-pr', '--teleport', '--cloud', '-w', '--worktree'}
+
+
+def die(msg):
+    print(f'claude-reload: {msg}', file=sys.stderr)
+    sys.exit(1)
+
+
+def log(msg):
+    try:
+        with open(LOG, 'a', encoding='utf-8') as fh:
+            fh.write(time.strftime('%Y-%m-%d %H:%M:%S ') + msg + '\n')
+    except OSError:
+        pass
+
+
+def procargs(pid):
+    """(exe, argv, env) exactly as the process was exec'd (macOS KERN_PROCARGS2)."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
+    size = ctypes.c_size_t(0)
+    if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0:
+        raise OSError(ctypes.get_errno(), f'sysctl size for pid {pid}')
+    buf = ctypes.create_string_buffer(size.value)
+    if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+        raise OSError(ctypes.get_errno(), f'sysctl procargs for pid {pid}')
+    raw = buf.raw[:size.value]
+    argc = struct.unpack('i', raw[:4])[0]
+    exe, _, rest = raw[4:].partition(b'\0')
+    parts = rest.lstrip(b'\0').split(b'\0')
+    dec = lambda b: b.decode('utf-8', 'surrogateescape')
+    argv = [dec(p) for p in parts[:argc]]
+    env = {}
+    for p in parts[argc:]:
+        if not p:
+            break
+        k, sep, v = dec(p).partition('=')
+        if sep:
+            env[k] = v
+    return dec(exe), argv, env
+
+
+def ps_field(pid, field):
+    r = subprocess.run(['ps', '-o', f'{field}=', '-p', str(pid)], capture_output=True, text=True)
+    return r.stdout.strip()
+
+
+def is_claude(pid):
+    try:
+        exe, argv, _ = procargs(pid)
+    except OSError:
+        return False
+    names = {os.path.basename(exe), os.path.basename(argv[0]) if argv else ''}
+    return 'claude' in names or '/claude/versions/' in exe
+
+
+def find_claude_pid():
+    hint = os.environ.get('CLAUDE_PID', '')
+    pid = os.getppid()
+    for _ in range(12):
+        if pid <= 1:
+            break
+        if str(pid) == hint or is_claude(pid):
+            return pid
+        pid = int(ps_field(pid, 'ppid') or 0)
+    die('not running inside Claude Code (no claude ancestor process found)')
+
+
+def session_id_for(pid):
+    try:
+        with open(os.path.join(HOME, '.claude', 'sessions', f'{pid}.json'), encoding='utf-8') as fh:
+            sid = json.load(fh).get('sessionId')
+        if sid:
+            return sid
+    except (OSError, ValueError):
+        pass
+    sid = os.environ.get('CLAUDE_CODE_SESSION_ID')
+    if sid:
+        return sid
+    die(f'cannot tell which session pid {pid} is running')
+
+
+def cwd_of(pid):
+    r = subprocess.run(['lsof', '-a', '-p', str(pid), '-d', 'cwd', '-Fn'], capture_output=True, text=True)
+    for line in r.stdout.splitlines():
+        if line.startswith('n'):
+            return line[1:]
+    die(f'cannot read the working directory of pid {pid}')
+
+
+def option_specs(claude):
+    """{flag: 'bool' | 'one' | 'opt' | 'many'} parsed from `claude --help`."""
+    out = subprocess.run([claude, '--help'], capture_output=True, text=True, timeout=30).stdout
+    specs = {}
+    for line in out.splitlines():
+        m = re.match(r'^  (-[\w-]+(?:, -[\w-]+)*)(?: (<[^>]*>|\[[^\]]*\]))?(?:\s|$)', line)
+        if not m:
+            continue
+        val = m.group(2)
+        kind = 'bool' if not val else ('many' if '...' in val else ('one' if val[0] == '<' else 'opt'))
+        for name in m.group(1).split(', '):
+            specs[name] = kind
+    if len(specs) < 20:
+        die('could not parse `claude --help`; refusing to guess which arguments are flags')
+    return specs
+
+
+def clean_args(args, specs):
+    """Keep the original flags, drop session-picking flags and any positional prompt."""
+    keep, i = [], 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a == '--':
+            break                                   # everything after is a prompt
+        if not a.startswith('-') or a == '-':
+            continue                                # positional prompt — never replay it
+        name, has_eq = a.split('=', 1)[0], '=' in a
+        if name in ('-p', '--print'):
+            die('this session runs in --print mode; nothing to relaunch')
+        kind = specs.get(name)
+        if kind is None:                            # unknown flag: keep a following value
+            kind = 'opt'
+        vals = []
+        if not has_eq:
+            if kind == 'one' and i < len(args):
+                vals, i = [args[i]], i + 1
+            elif kind == 'opt' and i < len(args) and not args[i].startswith('-'):
+                vals, i = [args[i]], i + 1
+            elif kind == 'many':
+                while i < len(args) and not args[i].startswith('-'):
+                    vals.append(args[i])
+                    i += 1
+        if name not in DROP_FLAGS:
+            keep += [a] + vals
+    return keep
+
+
+def relaunch_exe(exe):
+    real = os.path.realpath(exe)
+    if '/claude/versions/' in real or real == os.path.realpath(NATIVE):
+        return NATIVE                               # symlink → always the newest version
+    return exe
+
+
+def pane_sender(env):
+    """argv prefix that types text + Enter into this pane, or None."""
+    if env.get('HERDR_PANE_ID'):
+        herdr = shutil.which('herdr') or '/opt/homebrew/bin/herdr'
+        return 'herdr', lambda text: [herdr, 'pane', 'run', env['HERDR_PANE_ID'], text]
+    if env.get('ORCA_TERMINAL_HANDLE'):
+        orca = (shutil.which('orca') or os.path.join(env.get('ORCA_CLI_BIN_DIR', ''), 'orca'))
+        return 'orca', lambda text: [orca, 'terminal', 'send', '--terminal',
+                                     env['ORCA_TERMINAL_HANDLE'], '--text', text, '--enter']
+    return None, None
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def helper(claude_pid, shell_pid, sid, send):
+    """Runs detached: stop claude, wait for the shell prompt, type the relaunch."""
+    time.sleep(1.5)                                 # let claude render this command's output
+    log(f'{sid}: SIGTERM claude pid {claude_pid}')
+    os.kill(claude_pid, signal.SIGTERM)
+    deadline = time.time() + 20
+    while alive(claude_pid) and time.time() < deadline:
+        time.sleep(0.2)
+    if alive(claude_pid):
+        log(f'{sid}: claude still running after 20s — giving up, nothing relaunched')
+        return
+    deadline = time.time() + 5                      # shell back in the foreground (stat has '+')
+    while time.time() < deadline and '+' not in ps_field(shell_pid, 'stat'):
+        time.sleep(0.1)
+    time.sleep(0.4)
+    if not alive(shell_pid):
+        log(f'{sid}: pane shell {shell_pid} is gone — type `claude-relaunch {sid}` in a new shell')
+        return
+    if send is None:
+        log(f'{sid}: no herdr/Orca pane — user must type `claude-relaunch`')
+        return
+    r = subprocess.run(send(f'claude-relaunch {sid}'), capture_output=True, text=True)
+    log(f'{sid}: typed relaunch, exit {r.returncode} {(r.stdout + r.stderr).strip()[:300]}')
+
+
+def main():
+    opts = sys.argv[1:]
+    if {'-h', '--help'} & set(opts):
+        print(__doc__.strip())
+        return
+    unknown = [a for a in opts if a != '--dry-run']
+    if unknown:                                     # never relaunch on a typo
+        die(f'unknown argument {unknown[0]!r} (usage: claude-reload [--dry-run])')
+    dry = '--dry-run' in opts
+    claude_pid = find_claude_pid()
+    exe, argv, env = procargs(claude_pid)
+    sid = session_id_for(claude_pid)
+    cwd = cwd_of(claude_pid)
+    shell_pid = int(ps_field(claude_pid, 'ppid') or 0)
+    shell = os.path.basename(ps_field(shell_pid, 'comm')).lstrip('-')
+    if shell not in SHELLS:
+        die(f'claude was not started from a shell (parent is "{shell}"); exiting it would close '
+            f'the pane. Use /exit, then `claude --resume {sid}`.')
+    new_exe = relaunch_exe(exe)
+    args = clean_args(argv[1:], option_specs(new_exe))
+    via, send = pane_sender(env)
+    state = {'session_id': sid, 'cwd': cwd, 'exe': new_exe, 'argv0': argv[0] if argv else 'claude',
+             'args': args, 'env': env, 'created': time.time()}
+
+    if dry:
+        print(f'claude pid {claude_pid} (shell {shell} pid {shell_pid}), session {sid}')
+        print(f'cwd   {cwd}')
+        print(f'run   {new_exe} {" ".join(args)} --resume {sid}')
+        print(f'env   {len(env)} vars from the original launch (values not shown)')
+        print(f'pane  {via or "none — you would type claude-relaunch yourself"}')
+        return
+
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    path = os.path.join(STATE_DIR, f'{sid}.json')
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+        json.dump(state, fh)
+
+    if os.fork():                                   # parent: report and return to claude
+        how = f'via {via}' if via else 'then type `claude-relaunch` here'
+        print(f'Relaunching session {sid[:8]}… on the newest version in ~2s ({how}).')
+        return
+    os.setsid()
+    if os.fork():
+        os._exit(0)
+    devnull = os.open(os.devnull, os.O_RDWR)        # drop claude's pipes so it isn't kept waiting
+    for fd in (0, 1, 2):
+        os.dup2(devnull, fd)
+    os.closerange(3, 256)
+    try:
+        helper(claude_pid, shell_pid, sid, send)
+    except Exception as e:                          # noqa: BLE001 — log anything, never raise
+        log(f'{sid}: helper error {e!r}')
+    os._exit(0)
+
+
+if __name__ == '__main__':
+    main()
